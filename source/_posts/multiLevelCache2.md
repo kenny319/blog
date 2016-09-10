@@ -10,7 +10,20 @@ title: 多级缓存 （下）- 堆外缓存
 >* 本地缓存的一些开源解决方案
 >* 堆外缓存的一种实现OHC
 >* 使用堆外缓存需要注意的问题：序列化、内存管理、容量评估等
->* 如何在框架层面来使得多级缓存的使用简单易用
+
+## 开源实现
+
+本地缓存的开源实现也有不少，对于堆内缓存的开源方案则更多，比如Guava或者Ehcache，这个选择相对比较容易。这里我们重点关注的是堆外缓存的开源实现。了解到的主要有：
+
+* Ehcache 3.0：3.0基于其商业公司一个非开源的堆外组件的实现
+* Chronical Map：LGPL V3的license, 高级特性非开源
+* OHC：来源于Cassandra 3.0， Apache v2
+* Ignite: 一个规模宏大的内存计算框架，堆外缓存只是它的冰山一角的一角，Apache项目
+
+选型主要考虑成熟度、License、功能、性能、代码质量等等，这里不做详细的方案比较。如果需要进行定制化，一个满足需求的简单且能够驾驭的框架可能是更好的选择。
+
+本文后续的内容以OHC作为基础进行介绍。
+
 
 ## 堆外缓存关注点
 
@@ -18,7 +31,7 @@ title: 多级缓存 （下）- 堆外缓存
 从上一节我们大概可以了解到，存放一个JAVA对象到堆外缓存中需要有一个从JAVA对象到ByteBuffer的转换的过程。而为了尽量简化API的使用，使用者不需要去为对象编写特定的序列化过程，我们需要一个高效的序列化框架。先通过序列化框架序列化, 再转成堆外的ByteBuffer上。在堆外缓存的使用场景中，该序列化框架应该至少具备以下一些要求：
 
 >#### 高性能
->这个不用说，鬼都知道
+>这个不用说
 >#### 序列化的数据overhead小
 >由于堆外缓存本来就占用内存资源多，所以如果序列化框架序列化造成的overhead过大的话是无法接受的。其实如果序列化框架造成的overhead是定长的话是最完美的，少去了中间转换的过程，可以直接把JAVA对象序列化到堆外，大大提高了性能也能降低GC的频率。
 >#### 简单易用
@@ -30,25 +43,52 @@ title: 多级缓存 （下）- 堆外缓存
 >* 数据模型的兼容性：如果你的数据模型发生了变化，比如：增加属性、减少属性、更改类型等等，随着业务的发展这是非常平常的事。如果序列化框架默认无法直接支持，那最好有方法让用户自己做兼容性标记，如读的时候可以忽略增加或者减少的属性等等。
 >* 当然如果你的数据没有持久化又或者你的应用不支持热加载如OSGI可以不要考虑该问题。
 
-关于序列化协议的选择，有一个非常不错的benchmark可以参考 [jvm-serializers](https://github.com/eishay/jvm-serializers/wiki)，里面对各种序列化协议从各种不同维度进行了对比。最后我们选择了Kryo，因为Kryo在性能上以及序列化造成的overhead上均表现非常优异，且使用对用户透明。TODO 给个例子
+关于序列化协议的选择，有一个非常不错的benchmark可以参考 [jvm-serializers](https://github.com/eishay/jvm-serializers/wiki)，里面对各种序列化协议从各种不同维度进行了对比。最后我们选择了Kryo，因为Kryo在性能上以及序列化造成的overhead上均表现非常优异，且使用对用户透明。
 
+一个Kryo的使用例子：
+
+``` java
+// Setup ThreadLocal of Kryo instances
+private static final ThreadLocal<Kryo> kryos = new ThreadLocal<Kryo>() {
+    protected Kryo initialValue() {
+        Kryo kryo = new Kryo();
+        // configure kryo instance, customize settings
+        return kryo;
+    };
+};
+
+Kryo kryo = kryos.get();
+    // ...
+Output output = new Output(new FileOutputStream("file.bin"));
+SomeClass someObject = ...
+kryo.writeObject(output, someObject);
+output.close();
+// ...
+Input input = new Input(new FileInputStream("file.bin"));
+SomeClass someObject = kryo.readObject(input, SomeClass.class);
+input.close();
+```
+
+这里自己需要简单封装一下，因为Kryo不是线程安全的，且每次使用创建的成本较高，所以要么Pooling要么TLC.
 
 ### 内存管理
 #### JAVA堆外内存分配
 
 堆外内存的分配大家比较熟悉的是使用如下的JNI方式进行分配：
 
-~~~java
-java.nio.ByteBuffer.allocateDirect(int)
-~~~
+``` java
+java.nio.ByteBuffer.allocateDirect(int)           
+```
+
 大抵的原理是其内部还是使用的Unsafe进行的内存分配, 从下面的API声明可知该方法是一个JNI的封装。详细请参考：[Unsafe](http://www.docjar.com/html/api/sun/misc/Unsafe.java.html)。
 
-~~~java
+~~~ java
 public native long allocateMemory(long bytes)
 ~~~
+
 通过Unsafe进行分配的内存受限于XX:MaxDirectMemorySize的配置，换句话无论哪里用到了堆外缓存，只要通过Unsafe的方式进行的分配都是共享该Quota的。最好的方式其实是不同用途的堆外内存可以隔离开来，比如堆外缓存的一块，netty的一块。
 
-JNA（Java Native Access) 是社区开发的一套类库，号称是JNI的终结者。传统需要调用本地方法既要写c代码生成DLL/SO，又要写java代码进行封装才能提供JAVA调用，既繁琐效率又低。而JNA是通过libffi来实现的，提供了一套接口，用户只需要通过JAVA代码定义本地方法和数据类型，JNA负责把JAVA方法的调用进行Dispatch到相应的本地方法调用，你不再需要不厌其烦的为每个本地方法都写个C和JAVA的wrapper方法对。详细请参考我的另外一个文章。TODO
+JNA（Java Native Access) 是社区开发的一套类库，号称是JNI的终结者。传统需要调用本地方法既要写c代码生成DLL/SO，又要写java代码进行封装才能提供JAVA调用，既繁琐效率又低。而JNA是通过libffi来实现的，提供了一套接口，用户只需要通过JAVA代码定义本地方法和数据类型，JNA负责把JAVA方法的调用进行Dispatch到相应的本地方法调用，你不再需要不厌其烦的为每个本地方法都写个C和JAVA的wrapper方法对。限于篇幅，请参考另外一篇。
 
 先来看一下，通过JNA的malloc是怎么做的：
 
@@ -89,9 +129,9 @@ Segment的数量默认是内核的两倍，每个Segment的bucket数量默认是
 
 ### 容量评估
 
-当你使用堆外缓存时，一个很重要的就是需要提前进行内存容量的评估。这里有个需要重点考虑的因数是除了业务数据本身的大小之外，你还要考虑序列化框架的序列化和缓存框架本身的数据结构造成的overhead。以OHC为例，由OHC的数据结构可知，OHC造成的overhead = bucket number * 8字节 + entry number * 64个字节。
+当你使用堆外缓存时，一个很重要的就是需要提前进行内存容量的评估。这里有个需要重点考虑的因数是除了业务数据本身的大小之外，你还要考虑序列化框架的序列化和缓存框架本身的数据结构造成的overhead。比如：kryo需要可能需要存储对象的类名、属性类型、属性是否为空等各种标识，取决于你的对象的复杂程度，会造成额外的overhead. 另外，以OHC为例，由OHC的数据结构可知，OHC造成的overhead = bucket number \* 8字节 + entry number \* 64个字节。
 
-当然最稳妥的方式是进行压测！
+当然最稳妥的方式是根据业务情况进行压测！
 
 ## 写在最后
 
@@ -99,5 +139,6 @@ Segment的数量默认是内核的两倍，每个Segment的bucket数量默认是
 
 * 评测缓存数据量及更新频率对GC的影响，为选择堆内还是堆外缓存提供参考依据。
 * JNA + Jemalloc vs Unsafe vs ptmalloc 的性能评测。
+* 如何从框架层面简化多级缓存的使用
 
 就这么多吧！
