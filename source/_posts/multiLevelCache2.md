@@ -71,6 +71,43 @@ input.close();
 
 这里自己需要简单封装一下，因为Kryo不是线程安全的，且每次使用创建的成本较高，所以要么Pooling要么TLC.
 
+
+OHC需要先知道序列化的对象的大小用来提前分配堆外内存，然后构造成DirectByteBuffer，然后你需要把对象序列化到ByteBuffer中。
+
+``` java
+public interface CacheSerializer<T>
+{
+    void serialize(T value, ByteBuffer buf);
+
+    T deserialize(ByteBuffer buf);
+
+    int serializedSize(T value);
+}
+```
+如果说你的k/v比较简单，能够比较容易计算得出它序列化后的大小，其实最好的方式是绕过Kryo自己直接实现OHC的序列化接口，避免了额外的一次Kryo序列化和少了一次中间结果的内存复制。
+
+另外，如果你在序列化前想要计算一个字符串的长度，如果是可能包含非Ascii码字符的，一定不要通过String.getByte("utf-8")来计算得到，根据unicode的规范只需要简单遍历比较即可，性能至少提高5倍以上：
+
+``` java
+int strlen = str.length();
+int utflen = 0;
+int c;
+
+for (int i = 0; i < strlen; i++)
+{
+    c = str.charAt(i);
+    if ((c >= 0x0001) && (c <= 0x007F))
+        utflen++;
+    else if (c > 0x07FF)
+        utflen += 3;
+    else
+        utflen += 2;
+}
+return utflen;
+```
+
+
+
 ### 内存管理
 #### JAVA堆外内存分配
 
